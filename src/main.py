@@ -24,7 +24,7 @@ def ensure_minimum_dataset_size(data_by_car: dict, min_samples_per_car: int = 10
     
     return data_by_car
 
-def generate_large_dataset(output_dir: str, samples_per_car: int = 1000):
+def generate_large_dataset(output_dir: str, samples_per_car: int = 100):
     generator = TrainingDataGenerator(output_dir)
     print(f"Generating {samples_per_car} samples per car type...")
     dataset_info = generator.generate_dataset(samples_per_car)

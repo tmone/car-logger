@@ -1,0 +1,7 @@
+- Introduction for testing ODB2 dataset ()
++ Generate random 4 type car ( 100 test result/ car) each 4 error type (normal, sensor_dropout, noise_spike, signal_drift).
+ Each result test has above 6000 rows.
++ Dataset split 3 sub-dataset (train: 80%, validate: 10%, test: 10%)
+- Training train dataset: (Each car type train 10 epochs - 2 minutes)
+- Validating with validate dataset 
+- Using model to predict all test dataset

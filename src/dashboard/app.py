@@ -2,6 +2,7 @@ import sys
 import os
 from datetime import datetime
 from typing import Optional
+import traceback  # Add traceback import
 
 # Add src directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -29,17 +30,22 @@ def load_dataset_metadata():
         
     return metadata
 
-def load_existing_model(car_type: str) -> Optional[tf.keras.Model]:
+def load_existing_model(car_type: str, classifier: ErrorClassifier) -> Optional[tf.keras.Model]:
     """Try to load an existing model for the given car type"""
     model_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
-    model_path = os.path.join(model_dir, f'{car_type}_model.keras')
+    model_path = os.path.join(model_dir, f'{car_type}_model.weights.h5')  # Changed extension
     
     if os.path.exists(model_path):
         try:
             st.info(f"Found existing model at {model_path}")
-            return tf.keras.models.load_model(model_path)
+            # Rebuild model with same architecture first
+            model = classifier.build_model()
+            # Then load weights
+            model.load_weights(model_path)
+            return model
         except Exception as e:
             st.warning(f"Could not load existing model: {e}")
+            st.code(traceback.format_exc())
     return None
 
 def train_model(car_type: str, metadata: dict):
@@ -63,7 +69,7 @@ def train_model(car_type: str, metadata: dict):
     classifier = ErrorClassifier(batch_size=32)
     
     # Try to load existing model
-    model = load_existing_model(car_type)
+    model = load_existing_model(car_type, classifier)
     if model is None:
         model = classifier.build_model()
         st.write("Created new model")
@@ -100,54 +106,76 @@ def train_model(car_type: str, metadata: dict):
             train_files, valid_files, 
             progress_callback=update_progress
         )
-        st.success("Data loading complete!")
         
-        # Add debug information
-        st.write("Dataset shapes:")
-        for x, y in train_dataset.take(1):
-            st.write(f"Training batch shape: {x.shape}, Labels shape: {y.shape}")
+        # Unbatch datasets first
+        train_data = [(x.numpy(), y.numpy()) for x, y in train_dataset.unbatch()]
+        valid_data = [(x.numpy(), y.numpy()) for x, y in valid_dataset.unbatch()]
         
-        # Training progress tracking
+        train_size = len(train_data)
+        valid_size = len(valid_data)
+        
+        st.write(f"Training samples: {train_size}")
+        st.write(f"Validation samples: {valid_size}")
+        
+        # Recreate datasets from unbatched data
+        train_dataset = tf.data.Dataset.from_tensor_slices(
+            (
+                tf.convert_to_tensor([x for x, _ in train_data]),
+                tf.convert_to_tensor([y for _, y in train_data])
+            )
+        ).shuffle(1024).batch(classifier.batch_size)
+        
+        valid_dataset = tf.data.Dataset.from_tensor_slices(
+            (
+                tf.convert_to_tensor([x for x, _ in valid_data]),
+                tf.convert_to_tensor([y for _, y in valid_data])
+            )
+        ).batch(classifier.batch_size)
+        
+        # Training progress tracking - Move these before the callback class
         train_progress = st.progress(0)
         epoch_status = st.empty()
         metrics_status = st.empty()
         
         st.write("Starting training...")
         
+        # Callback class that now has access to the progress variables
         class TrainingCallback(tf.keras.callbacks.Callback):
+            def __init__(self):
+                super().__init__()
+                self.train_progress = train_progress
+                self.epoch_status = epoch_status
+                self.metrics_status = metrics_status
+                
             def on_epoch_begin(self, epoch, logs=None):
-                epoch_status.text(f'Training Epoch {epoch+1}/{epochs}')
+                self.epoch_status.text(f'Training Epoch {epoch+1}/{epochs}')
                 
             def on_epoch_end(self, epoch, logs=None):
                 progress = (epoch + 1) / epochs
-                train_progress.progress(progress)
+                self.train_progress.progress(progress)
                 if logs:
-                    metrics_status.text(
+                    self.metrics_status.text(
                         f"Loss: {logs.get('loss', 0):.4f} | "
                         f"Accuracy: {logs.get('accuracy', 0):.4f} | "
                         f"Val Loss: {logs.get('val_loss', 0):.4f} | "
                         f"Val Accuracy: {logs.get('val_accuracy', 0):.4f}"
                     )
         
-        # Ensure datasets are not empty
-        train_dataset = train_dataset.cache()
-        valid_dataset = valid_dataset.cache()
-        
         history = model.fit(
             train_dataset,
             validation_data=valid_dataset,
             epochs=epochs,
             callbacks=[TrainingCallback()],
-            verbose=1  # Changed to 1 to see training progress
+            verbose=1
         )
         
-        return model, history
+        return model, history, classifier  # Add classifier to return values
         
     except Exception as e:
         st.error(f"Error during training: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
-        return None, None
+        return None, None, None
 
 def evaluate_model(model, metadata: dict, car_type: str, classifier: ErrorClassifier):
     # Get test files
@@ -169,17 +197,33 @@ def evaluate_model(model, metadata: dict, car_type: str, classifier: ErrorClassi
         test_dataset = classifier.load_dataset(
             test_files, test_files,  # Pass same files twice since load_dataset expects both train and valid
             progress_callback=update_progress
-        )
-        st.success("Test data loading complete!")
+        )[0]  # Only take first dataset since we don't need validation for testing
         
-        # Evaluate model
+        # Unbatch dataset
+        test_data = [(x.numpy(), y.numpy()) for x, y in test_dataset.unbatch()]
+        test_size = len(test_data)
+        
+        # Recreate dataset from unbatched data
+        test_dataset = tf.data.Dataset.from_tensor_slices(
+            (
+                tf.convert_to_tensor([x for x, _ in test_data]),
+                tf.convert_to_tensor([y for _, y in test_data])
+            )
+        ).batch(classifier.batch_size)
+        
+        # No need for steps parameter
         results = model.evaluate(test_dataset, verbose=0)
         
-        # Display metrics
+        # Display metrics - Handle different metric names
         metrics = dict(zip(model.metrics_names, results))
         col1, col2 = st.columns(2)
-        col1.metric("Test Accuracy", f"{metrics['accuracy']:.4f}")
-        col2.metric("Test Loss", f"{metrics['loss']:.4f}")
+        
+        # Handle different possible metric names
+        accuracy = metrics.get('accuracy', metrics.get('acc', 0.0))
+        loss = metrics.get('loss', 0.0)
+        
+        col1.metric("Test Accuracy", f"{accuracy:.4f}")
+        col2.metric("Test Loss", f"{loss:.4f}")
         
         # Generate predictions
         st.write("Generating predictions...")
@@ -306,7 +350,7 @@ def main():
     if st.button("Train Model"):
         st.header("Model Training")
         with st.spinner('Training model...'):
-            model, history = train_model(selected_car, metadata)
+            model, history, classifier = train_model(selected_car, metadata)  # Get classifier from train_model
             
             if model is not None and history is not None:
                 # Plot training history
@@ -314,12 +358,12 @@ def main():
                 fig = px.line(hist_df, title='Model Training History')
                 st.plotly_chart(fig)
                 
-                # Save model
+                # Save model weights with correct extension
                 model_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
                 os.makedirs(model_dir, exist_ok=True)
-                model_path = os.path.join(model_dir, f'{selected_car}_model.keras')
-                model.save(model_path, save_format='keras')
-                st.success(f"Model training completed and saved to {model_path}")
+                model_path = os.path.join(model_dir, f'{selected_car}_model.weights.h5')  # Changed extension
+                model.save_weights(model_path)
+                st.success(f"Model weights saved to {model_path}")
                 
                 # Evaluate model
                 evaluate_model(model, metadata, selected_car, classifier)
